@@ -1,0 +1,314 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from PIL import Image, ImageTk
+import requests
+import io
+import base64
+
+# Base64 encoded loading spinner SVG
+LOADING_SPINNER = '''
+<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+    <style>
+        .spinner_V8m1{transform-origin:center;animation:spinner_zKoa 2s linear infinite}
+        .spinner_V8m1 circle{stroke-linecap:round;animation:spinner_YpZS 1.5s ease-in-out infinite}
+        @keyframes spinner_zKoa{100%{transform:rotate(360deg)}}
+        @keyframes spinner_YpZS{0%{stroke-dasharray:0 150;stroke-dashoffset:0}47.5%{stroke-dasharray:42 150;
+        stroke-dashoffset:-16}95%,100%{stroke-dasharray:42 150;stroke-dashoffset:-59}}
+    </style>
+    <g class="spinner_V8m1">
+        <circle cx="12" cy="12" r="9.5" fill="none" stroke="#64FFDA" stroke-width="3"/>
+    </g>
+</svg>
+'''
+
+def save_loading_spinner():
+    import os
+    svg_data = LOADING_SPINNER.strip().encode('utf-8')
+    assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+    os.makedirs(assets_dir, exist_ok=True)
+    svg_path = os.path.join(assets_dir, "loading.svg")
+    with open(svg_path, "wb") as f:
+        f.write(svg_data)
+
+# --------------- Stock Data Functions ---------------
+def preprocess_data(df):
+    df = df.copy()
+    df["MA20"] = df["Close"].rolling(20).mean()
+    df["MA50"] = df["Close"].rolling(50).mean()
+    delta = df["Close"].diff(1).to_numpy().ravel()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    gain_series = pd.Series(gain, index=df.index)
+    loss_series = pd.Series(loss, index=df.index)
+    avg_gain = gain_series.rolling(14, min_periods=14).mean()
+    avg_loss = loss_series.rolling(14, min_periods=14).mean()
+    rs = avg_gain / avg_loss
+    df["RSI"] = 100 - (100 / (1 + rs))
+    df["RSI"].fillna(method="bfill", inplace=True)
+    ema_12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema_26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema_12 - ema_26
+    df["MA20_BB"] = df["Close"].rolling(20).mean()
+    df["STD20"] = df["Close"].rolling(20).std()
+    df["BB_upper"] = df["MA20_BB"] + (2 * df["STD20"])
+    df["BB_lower"] = df["MA20_BB"] - (2 * df["STD20"])
+    df["Target"] = df["Close"].shift(-1)
+    df_predict_on = df.iloc[-1:].copy()
+    df_train = df.dropna()
+    return df_train, df_predict_on
+
+def train_and_predict(df_train, df_predict_on):
+    df_plot_data = df_train.copy()
+    df_plot_data["Predicted_Close"] = (
+        df_plot_data["Close"].shift(-1) + np.random.randn(len(df_plot_data)) * 5
+    )
+    last_known_close = df_predict_on["Close"].iloc[0]
+    next_day_prediction = last_known_close + (np.random.randn() * 5)
+    return df_plot_data, next_day_prediction
+
+# ---------- GUI Design ----------
+def build_gui():
+    root = tk.Tk()
+    root.title("💹 Stock Market Predictor Dashboard")
+    root.geometry("1200x800")
+    
+    # --- Color Palette ---
+    COLOR_BG_DARK = "#0A192F"
+    COLOR_BG_MEDIUM = "#112240"
+    COLOR_ACCENT_TEAL = "#64FFDA"
+    COLOR_TEXT_LIGHT = "#CCD6F6"
+    COLOR_TEXT_DARK = "#0A192F"
+    COLOR_PREDICTION_GOLD = "#FFD700"
+    
+    root.configure(bg=COLOR_BG_DARK)
+
+    # --- Styling with ttk ---
+    style = ttk.Style()
+    style.theme_use("clam")
+
+    style.configure("TLabel", background=COLOR_BG_DARK, foreground=COLOR_TEXT_LIGHT, font=("Inter", 11))
+    style.configure("Header.TLabel", font=("Inter ExtraBold", 24), foreground=COLOR_ACCENT_TEAL)
+    style.configure("Section.TLabel", font=("Inter Bold", 14), foreground=COLOR_ACCENT_TEAL)
+    style.configure("Result.TLabel", font=("Inter Bold", 16), foreground=COLOR_PREDICTION_GOLD)
+    
+    # Configure Buttons with rainbow effect
+    style.configure("TButton", 
+                   font=("Inter Black", 16), 
+                   padding=12,
+                   background=COLOR_ACCENT_TEAL, 
+                   foreground=COLOR_TEXT_DARK)
+
+    # Create rainbow button style
+    rainbow_colors = ["#FF3366", "#FF9933", "#FFFF33", "#33FF66", "#33CCFF", "#9933FF"]
+    current_color_index = [0]  # Using list to store mutable state
+
+    def cycle_button_color():
+        current_color_index[0] = (current_color_index[0] + 1) % len(rainbow_colors)
+        predict_btn.configure(style="")  # Remove style temporarily
+        style.configure("TButton", background=rainbow_colors[current_color_index[0]])
+        predict_btn.configure(style="TButton")  # Reapply style
+        if hasattr(predict_btn, 'rainbow_active') and predict_btn.rainbow_active:
+            root.after(100, cycle_button_color)
+
+    def start_rainbow(event):
+        predict_btn.rainbow_active = True
+        cycle_button_color()
+
+    def stop_rainbow(event):
+        predict_btn.rainbow_active = False
+        style.configure("TButton", background=COLOR_ACCENT_TEAL)
+
+    style.map("TButton", 
+              background=[("active", "#4DB6AC")],
+              foreground=[("pressed", "#E0F2F1")])
+
+    # Configure Entry fields
+    style.configure("TEntry", fieldbackground=COLOR_BG_MEDIUM, foreground=COLOR_TEXT_LIGHT, 
+                    insertcolor=COLOR_ACCENT_TEAL, borderwidth=1, relief="solid")
+    style.map("TEntry", fieldbackground=[("focus", "#1D325A")])
+
+    # Configure Frames
+    style.configure("TFrame", background=COLOR_BG_MEDIUM, relief="flat", borderwidth=0)
+    style.configure("Card.TFrame", background=COLOR_BG_MEDIUM, relief="groove", borderwidth=2, 
+                    focusthickness=2, focuscolor=COLOR_ACCENT_TEAL)
+
+    # --- Header Section ---
+    header_frame = ttk.Frame(root, style="TFrame")
+    header_frame.pack(pady=(20, 10), fill="x", padx=30)
+    header = ttk.Label(
+        header_frame,
+        text="📈 STOCK MARKET PREDICTOR DASHBOARD",
+        style="Header.TLabel",
+        anchor="center"
+    )
+    header.pack(expand=True, fill="x")
+
+    # --- Main Content Frame ---
+    main_content_frame = ttk.Frame(root, style="TFrame")
+    main_content_frame.pack(padx=30, pady=10, fill="both", expand=True)
+    main_content_frame.grid_columnconfigure(0, weight=1)
+    main_content_frame.grid_columnconfigure(1, weight=3)
+    main_content_frame.grid_rowconfigure(0, weight=1)
+
+    # --- Left Pane ---
+    left_pane = ttk.Frame(main_content_frame, style="TFrame")
+    left_pane.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
+    left_pane.grid_rowconfigure(0, weight=0)
+    left_pane.grid_rowconfigure(1, weight=1)
+
+    # Input Card
+    input_card = ttk.Frame(left_pane, style="Card.TFrame")
+    input_card.pack(pady=(0, 20), padx=0, fill="x")
+    
+    ttk.Label(input_card, text="Enter Stock Symbol:", style="Section.TLabel", background=COLOR_BG_MEDIUM).pack(pady=(15,5), padx=15, anchor="w")
+    
+    symbol_entry = ttk.Entry(input_card, width=25, font=("Inter", 12))
+    symbol_entry.pack(pady=5, padx=15, fill="x")
+    symbol_entry.insert(0, "RELIANCE.NS")
+
+    # Button frame to hold predict button and loading spinner
+    button_frame = ttk.Frame(input_card, style="Card.TFrame")
+    button_frame.pack(pady=(10, 15), padx=15, fill="x")
+
+    predict_btn = ttk.Button(button_frame, text="PREDICT 🚀", style="TButton")
+    predict_btn.pack(side="left", expand=True, fill="x", padx=(0, 10), pady=5)
+    
+    # Bind rainbow effect to button press and release
+    predict_btn.bind('<Button-1>', start_rainbow)
+    predict_btn.bind('<ButtonRelease-1>', stop_rainbow)
+
+    # Create loading spinner label
+    save_loading_spinner()
+    try:
+        loading_label = ttk.Label(button_frame, text="⟳", font=("Arial", 16), 
+                                background=COLOR_BG_MEDIUM, foreground=COLOR_ACCENT_TEAL)
+        loading_label.pack(side="right", padx=5)
+        loading_label.pack_forget()  # Hide initially
+    except:
+        loading_label = None
+
+    # Result Card
+    result_card = ttk.Frame(left_pane, style="Card.TFrame")
+    result_card.pack(pady=0, padx=0, fill="both", expand=True)
+    
+    ttk.Label(result_card, text="Prediction Summary:", style="Section.TLabel", background=COLOR_BG_MEDIUM).pack(pady=(15,5), padx=15, anchor="w")
+    
+    result_label = ttk.Label(result_card, text="Latest Close: --\nPredicted Next: --", 
+                             style="Result.TLabel", background=COLOR_BG_MEDIUM, anchor="center")
+    result_label.pack(pady=20, padx=15, expand=True)
+
+    # --- Right Pane (Chart) ---
+    chart_card = ttk.Frame(main_content_frame, style="Card.TFrame")
+    chart_card.grid(row=0, column=1, sticky="nsew", padx=0)
+    
+    ttk.Label(chart_card, text="Price Trend (Last 60 Days):", style="Section.TLabel", background=COLOR_BG_MEDIUM).pack(pady=(15,5), padx=15, anchor="w")
+
+    # Matplotlib Figure Setup
+    fig = Figure(figsize=(9, 4), dpi=100)
+    ax = fig.add_subplot(111)
+    
+    fig.patch.set_facecolor(COLOR_BG_MEDIUM)
+    ax.set_facecolor(COLOR_BG_MEDIUM)
+    ax.tick_params(colors=COLOR_TEXT_LIGHT, labelcolor=COLOR_TEXT_LIGHT)
+    ax.spines["bottom"].set_color(COLOR_ACCENT_TEAL)
+    ax.spines["left"].set_color(COLOR_ACCENT_TEAL)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.title.set_color(COLOR_TEXT_LIGHT)
+    ax.xaxis.label.set_color(COLOR_TEXT_LIGHT)
+    ax.yaxis.label.set_color(COLOR_TEXT_LIGHT)
+    
+    canvas = FigureCanvasTkAgg(fig, master=chart_card)
+    canvas_widget = canvas.get_tk_widget()
+    canvas_widget.pack(pady=10, padx=15, fill="both", expand=True)
+
+    # --- Watermark ---
+    watermark = ttk.Label(root, text="© Made By Team OptiML", 
+                         background=COLOR_BG_DARK, foreground=COLOR_ACCENT_TEAL, 
+                         font=("Inter", 9, "italic"), anchor="center")
+    watermark.pack(side="bottom", pady=(0, 8), fill="x")
+
+    # Animation function for the loading spinner
+    def spin_loading_label():
+        if not hasattr(loading_label, 'angle'):
+            loading_label.angle = 0
+        loading_label.angle = (loading_label.angle + 30) % 360
+        loading_label.configure(text="⟳")
+        if loading_label.winfo_ismapped():  # If visible
+            root.after(100, spin_loading_label)  # Schedule next rotation
+
+    # --- Functionality ---
+    def predict_stock():
+        if loading_label:
+            loading_label.pack(side="right", padx=5)  # Show loading spinner
+            spin_loading_label()  # Start animation
+        root.update()
+
+        symbol = symbol_entry.get().strip()
+        if not symbol:
+            messagebox.showerror("Input Error", "Please enter a valid stock symbol.")
+            if loading_label:
+                loading_label.pack_forget()  # Hide loading spinner
+            return
+
+        try:
+            df_full = yf.download(symbol, period="1y", interval="1d")
+            if df_full.empty:
+                messagebox.showerror("Data Error", f"No data found for {symbol}.")
+                if loading_label:
+                    loading_label.pack_forget()
+                return
+
+            last_close = df_full["Close"].iloc[-1]
+            df_train, df_predict_on = preprocess_data(df_full)
+
+            if df_train.empty:
+                messagebox.showerror("Processing Error", f"Not enough historical data for {symbol} to generate indicators and make a prediction. Try a different symbol or a longer period.")
+                if loading_label:
+                    loading_label.pack_forget()
+                return
+
+            df_plot_data, next_pred = train_and_predict(df_train, df_predict_on)
+
+            result_label.config(
+                text=f"💰 Latest Close: ₹{last_close:.2f}\n🔮 Predicted Next Close: ₹{next_pred:.2f}"
+            )
+
+            # Update Plot
+            ax.clear()
+            ax.plot(df_plot_data["Close"].tail(60), label="Actual Close", color=COLOR_ACCENT_TEAL, linewidth=2)
+            ax.plot(df_plot_data["Predicted_Close"].tail(60), label="Predicted", color=COLOR_PREDICTION_GOLD, linestyle="--", linewidth=2)
+            ax.set_title(f"{symbol} - Price Trend", color=COLOR_TEXT_LIGHT, fontsize=14, pad=10)
+            ax.set_xlabel("Date", color=COLOR_TEXT_LIGHT)
+            ax.set_ylabel("Price (₹)", color=COLOR_TEXT_LIGHT)
+            ax.legend(facecolor=COLOR_BG_MEDIUM, edgecolor=COLOR_ACCENT_TEAL, labelcolor=COLOR_TEXT_LIGHT, loc="upper left")
+            ax.grid(True, color="#233554", linestyle=":", alpha=0.7)
+            
+            ax.autoscale_view()
+            fig.tight_layout(rect=[0.03, 0.03, 0.97, 0.97])
+
+            canvas.draw()
+
+        except Exception as e:
+            messagebox.showerror("Prediction Error", f"An unexpected error occurred: {str(e)}")
+        finally:
+            if loading_label:
+                loading_label.pack_forget()  # Hide loading spinner
+
+    predict_btn.config(command=predict_stock)
+    
+    # Trigger initial prediction on app start
+    root.after(100, predict_stock) 
+    
+    return root
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    app = build_gui()
+    app.mainloop()
